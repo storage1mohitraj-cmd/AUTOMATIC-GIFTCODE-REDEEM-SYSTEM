@@ -661,11 +661,19 @@ if __name__ == "__main__":
                 update = False
                 
                 if not is_container():
-                    if "--autoupdate" in sys.argv or repair_mode:
+                    autoupdate_flag = "--autoupdate" in sys.argv or (os.getenv("AUTOUPDATE", "").strip() in ["1", "true", "True"]) or repair_mode
+                    non_interactive = not sys.stdin.isatty()
+                    if autoupdate_flag:
                         update = True
+                    elif non_interactive:
+                        print(F.YELLOW + "Non-interactive terminal detected. Skipping update prompt." + R)
+                        update = False
                     else:
-                        print("Note: If your terminal is not interactive, you can use the --autoupdate argument to skip this prompt.")
-                        ask = input("Do you want to update? (y/n): ").strip().lower()
+                        try:
+                            ask = input("Do you want to update? (y/n): ").strip().lower()
+                        except EOFError:
+                            print(F.YELLOW + "Input unavailable. Skipping update." + R)
+                            ask = "n"
                         update = ask == "y"
                 else:
                     print(F.YELLOW + "Running in a container. Skipping update prompt." + R)
