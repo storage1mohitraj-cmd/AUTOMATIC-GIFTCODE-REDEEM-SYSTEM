@@ -876,14 +876,13 @@ if __name__ == "__main__":
 
     init(autoreset=True)
 
-    token_file = "bot_token.txt"
-    if not os.path.exists(token_file):
-        bot_token = input("Enter the bot token: ")
-        with open(token_file, "w") as f:
-            f.write(bot_token)
-    else:
-        with open(token_file, "r") as f:
-            bot_token = f.read().strip()
+    from dotenv import load_dotenv
+    load_dotenv()
+    load_dotenv(os.path.join("db", ".env"))
+    bot_token = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+    if not bot_token:
+        print(F.RED + "BOT_TOKEN is not set in .env" + R)
+        sys.exit(1)
 
     if not os.path.exists("db"):
         os.makedirs("db")
