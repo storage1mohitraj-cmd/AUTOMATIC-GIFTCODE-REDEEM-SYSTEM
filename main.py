@@ -357,6 +357,29 @@ def get_latest_release_info(beta_mode=False):
     print("All update sources failed")
     return None
 
+def _semver_tuple(tag):
+    t = str(tag).strip()
+    if t.startswith('v'):
+        t = t[1:]
+    t = t.split('-')[0]
+    parts = t.split('.')
+    nums = []
+    for p in parts:
+        try:
+            n = int(''.join(ch for ch in p if ch.isdigit()))
+        except Exception:
+            n = 0
+        nums.append(n)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+def is_version_newer(current, latest):
+    try:
+        return _semver_tuple(latest) > _semver_tuple(current)
+    except Exception:
+        return str(current).strip() != str(latest).strip()
+
 def download_requirements_from_release(beta_mode=False):
     """
     Download requirements.txt file directly from the latest release or main branch if beta mode.
@@ -648,15 +671,15 @@ if __name__ == "__main__":
             if not repair_mode:
                 print(F.CYAN + f"Current version: {current_version}" + R)
 
-            if current_version != latest_tag or repair_mode:
+            if is_version_newer(current_version, latest_tag) or repair_mode:
                 if repair_mode:
                     print(F.YELLOW + f"Repairing installation using: {latest_tag} (from {source_name})" + R)
                     print("This will overwrite existing files and restore any missing components.")
                 else:
                     print(F.YELLOW + f"New version available: {latest_tag} (from {source_name})" + R)
                     print("Update Notes:")
-                    print(release_info["body"])
-                print()
+                    print(release_info["body"]) 
+                    print()
                 
                 update = False
                 
