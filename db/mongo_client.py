@@ -3,6 +3,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
+import certifi
 
 
 _client: Optional[MongoClient] = None
@@ -46,7 +47,11 @@ def get_client() -> MongoClient:
         slash_params = f"/?{params}" if params else ""
         uri = f"mongodb://{auth_part}{host}{slash_params}"
 
-    _client = MongoClient(uri)
+    use_tls = uri.startswith("mongodb+srv://") or "mongodb.net" in uri or os.getenv("MONGO_TLS", "").strip() in ["1", "true", "True"]
+    if use_tls:
+        _client = MongoClient(uri, tlsCAFile=certifi.where())
+    else:
+        _client = MongoClient(uri)
     return _client
 
 

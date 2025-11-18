@@ -1030,7 +1030,21 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error syncing commands: {e}")
 
+    async def run_health_server():
+        from aiohttp import web
+        port = int(os.getenv("PORT", "10000"))
+        async def _ok(_):
+            return web.Response(text="OK")
+        app = web.Application()
+        app.router.add_get("/", _ok)
+        app.router.add_get("/health", _ok)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+
     async def main():
+        asyncio.create_task(run_health_server())
         await load_cogs()
         
         await bot.start(bot_token)
