@@ -53,6 +53,22 @@ class MongoAdapter:
     def changes(self) -> Collection:
         return self.db["changes"]
 
+    @property
+    def giftcodecontrol(self) -> Collection:
+        return self.db["giftcodecontrol"]
+
+    @property
+    def giftcode_channel(self) -> Collection:
+        return self.db["giftcode_channel"]
+
+    @property
+    def alliance_logs(self) -> Collection:
+        return self.db["alliance_logs"]
+
+    @property
+    def adminserver(self) -> Collection:
+        return self.db["adminserver"]
+
     # --- Setup / Indexes ---
     def ensure_indexes(self) -> None:
         """Create indexes approximating unique keys from the SQLite schema."""

@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3
+from db.mongo_adapter import mongo
+import pymongo
 import asyncio
 import time
 from typing import List
@@ -62,11 +63,6 @@ def fix_rtl(text):
 class AllianceMemberOperations(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.conn_alliance = sqlite3.connect('db/alliance.sqlite')
-        self.c_alliance = self.conn_alliance.cursor()
-        
-        self.conn_users = sqlite3.connect('db/users.sqlite')
-        self.c_users = self.conn_users.cursor()
         
         self.level_mapping = {
             31: "30-1", 32: "30-2", 33: "30-3", 34: "30-4",
@@ -148,24 +144,16 @@ class AllianceMemberOperations(commands.Cog):
             )
             async def add_member_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
                 try:
-                    is_admin = False
-                    is_initial = 0
+                    admin = mongo.admin.find_one({"id": button_interaction.user.id})
                     
-                    with sqlite3.connect('db/settings.sqlite') as settings_db:
-                        cursor = settings_db.cursor()
-                        cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (button_interaction.user.id,))
-                        result = cursor.fetchone()
-                        
-                        if result:
-                            is_admin = True
-                            is_initial = result[0] if result[0] is not None else 0
-                        
-                    if not is_admin:
+                    if not admin:
                         await button_interaction.response.send_message(
-                            "❌ You don't have permission to use this command.", 
+                            "❌ You do not have permission to use this command.", 
                             ephemeral=True
                         )
                         return
+                        
+                    is_initial = admin.get("is_initial", 0)
 
                     alliances, special_alliances, is_global = await self.cog.get_admin_alliances(
                         button_interaction.user.id, 
@@ -204,11 +192,8 @@ class AllianceMemberOperations(commands.Cog):
 
                     alliances_with_counts = []
                     for alliance_id, name in alliances:
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                            member_count = cursor.fetchone()[0]
-                            alliances_with_counts.append((alliance_id, name, member_count))
+                        member_count = mongo.users.count_documents({"alliance": int(alliance_id)})
+                        alliances_with_counts.append((alliance_id, name, member_count))
 
                     view = AllianceSelectView(alliances_with_counts, self.cog)
                     
@@ -301,20 +286,16 @@ class AllianceMemberOperations(commands.Cog):
                     async def select_callback(interaction: discord.Interaction):
                         alliance_id = int(view.current_select.values[0])
                         
-                        with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                            cursor = alliance_db.cursor()
-                            cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                            alliance_name = cursor.fetchone()[0]
+                        alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                        alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
                         
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute("""
-                                SELECT fid, nickname, furnace_lv 
-                                FROM users 
-                                WHERE alliance = ? 
-                                ORDER BY furnace_lv DESC, nickname
-                            """, (alliance_id,))
-                            members = cursor.fetchall()
+                        members = list(mongo.users.find(
+                            {"alliance": int(alliance_id)},
+                            {"fid": 1, "nickname": 1, "furnace_lv": 1}
+                        ).sort([("furnace_lv", -1), ("nickname", 1)]))
+                        
+                        # Convert to list of tuples to match previous format
+                        members = [(m["fid"], m["nickname"], m["furnace_lv"]) for m in members]
                             
                         if not members:
                             await interaction.response.send_message(
@@ -371,24 +352,15 @@ class AllianceMemberOperations(commands.Cog):
 
                                 async def confirm_callback(confirm_interaction: discord.Interaction):
                                     if confirm_interaction.data["custom_id"] == "confirm_all":
-                                        with sqlite3.connect('db/users.sqlite') as users_db:
-                                            cursor = users_db.cursor()
-                                            cursor.execute("SELECT fid, nickname FROM users WHERE alliance = ?", (alliance_id,))
-                                            removed_members = cursor.fetchall()
-                                            cursor.execute("DELETE FROM users WHERE alliance = ?", (alliance_id,))
-                                            users_db.commit()
+                                        removed_members = list(mongo.users.find({"alliance": int(alliance_id)}, {"fid": 1, "nickname": 1}))
+                                        removed_members = [(m["fid"], m["nickname"]) for m in removed_members]
+                                        
+                                        mongo.users.delete_many({"alliance": int(alliance_id)})
                                         
                                         try:
-                                            with sqlite3.connect('db/settings.sqlite') as settings_db:
-                                                cursor = settings_db.cursor()
-                                                cursor.execute("""
-                                                    SELECT channel_id 
-                                                    FROM alliance_logs 
-                                                    WHERE alliance_id = ?
-                                                """, (alliance_id,))
-                                                alliance_log_result = cursor.fetchone()
-                                                
-                                                if alliance_log_result and alliance_log_result[0]:
+                                            alliance_log_result = mongo.alliance_logs.find_one({"alliance_id": int(alliance_id)})
+                                            
+                                            if alliance_log_result and alliance_log_result.get("channel_id"):
                                                     log_embed = discord.Embed(
                                                         title="🗑️ Mass Member Removal",
                                                         description=(
@@ -406,7 +378,7 @@ class AllianceMemberOperations(commands.Cog):
                                                     )
                                                     
                                                     try:
-                                                        alliance_channel_id = int(alliance_log_result[0])
+                                                        alliance_channel_id = int(alliance_log_result["channel_id"])
                                                         alliance_log_channel = self.bot.get_channel(alliance_channel_id)
                                                         if alliance_log_channel:
                                                             await alliance_log_channel.send(embed=log_embed)
@@ -439,26 +411,16 @@ class AllianceMemberOperations(commands.Cog):
                             
                             else:
                                 try:
-                                    selected_fid = selected_value
-                                    with sqlite3.connect('db/users.sqlite') as users_db:
-                                        cursor = users_db.cursor()
-                                        cursor.execute("SELECT nickname FROM users WHERE fid = ?", (selected_fid,))
-                                        nickname = cursor.fetchone()[0]
-                                        
-                                        cursor.execute("DELETE FROM users WHERE fid = ?", (selected_fid,))
-                                        users_db.commit()
+                                    selected_fid = int(selected_value)
+                                    user_doc = mongo.users.find_one({"fid": selected_fid})
+                                    nickname = user_doc["nickname"] if user_doc else "Unknown"
+                                    
+                                    mongo.users.delete_one({"fid": selected_fid})
                                     
                                     try:
-                                        with sqlite3.connect('db/settings.sqlite') as settings_db:
-                                            cursor = settings_db.cursor()
-                                            cursor.execute("""
-                                                SELECT channel_id 
-                                                FROM alliance_logs 
-                                                WHERE alliance_id = ?
-                                            """, (alliance_id,))
-                                            alliance_log_result = cursor.fetchone()
-                                            
-                                            if alliance_log_result and alliance_log_result[0]:
+                                        alliance_log_result = mongo.alliance_logs.find_one({"alliance_id": int(alliance_id)})
+                                        
+                                        if alliance_log_result and alliance_log_result.get("channel_id"):
                                                 log_embed = discord.Embed(
                                                     title="🗑️ Member Removed",
                                                     description=(
@@ -473,7 +435,7 @@ class AllianceMemberOperations(commands.Cog):
                                                 )
                                                 
                                                 try:
-                                                    alliance_channel_id = int(alliance_log_result[0])
+                                                    alliance_channel_id = int(alliance_log_result["channel_id"])
                                                     alliance_log_channel = self.bot.get_channel(alliance_channel_id)
                                                     if alliance_log_channel:
                                                         await alliance_log_channel.send(embed=log_embed)
@@ -525,19 +487,16 @@ class AllianceMemberOperations(commands.Cog):
             )
             async def view_members_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
                 try:
-                    with sqlite3.connect('db/settings.sqlite') as settings_db:
-                        cursor = settings_db.cursor()
-                        cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (button_interaction.user.id,))
-                        admin_result = cursor.fetchone()
+                    admin = mongo.admin.find_one({"id": button_interaction.user.id})
+                    
+                    if not admin:
+                        await button_interaction.response.send_message(
+                            "❌ You do not have permission to use this command.", 
+                            ephemeral=True
+                        )
+                        return
                         
-                        if not admin_result:
-                            await button_interaction.response.send_message(
-                                "❌ You do not have permission to use this command.", 
-                                ephemeral=True
-                            )
-                            return
-                            
-                        is_initial = admin_result[0]
+                    is_initial = admin.get("is_initial", 0)
 
                     alliances, special_alliances, is_global = await self.cog.get_admin_alliances(
                         button_interaction.user.id, 
@@ -576,31 +535,24 @@ class AllianceMemberOperations(commands.Cog):
 
                     alliances_with_counts = []
                     for alliance_id, name in alliances:
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                            member_count = cursor.fetchone()[0]
-                            alliances_with_counts.append((alliance_id, name, member_count))
+                        member_count = mongo.users.count_documents({"alliance": int(alliance_id)})
+                        alliances_with_counts.append((alliance_id, name, member_count))
 
                     view = AllianceSelectView(alliances_with_counts, self.cog)
                     
                     async def select_callback(interaction: discord.Interaction):
                         alliance_id = int(view.current_select.values[0])
                         
-                        with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                            cursor = alliance_db.cursor()
-                            cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                            alliance_name = cursor.fetchone()[0]
+                        alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                        alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
                         
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute("""
-                                SELECT fid, nickname, furnace_lv
-                                FROM users 
-                                WHERE alliance = ? 
-                                ORDER BY furnace_lv DESC, nickname
-                            """, (alliance_id,))
-                            members = cursor.fetchall()
+                        members = list(mongo.users.find(
+                            {"alliance": int(alliance_id)},
+                            {"fid": 1, "nickname": 1, "furnace_lv": 1}
+                        ).sort([("furnace_lv", -1), ("nickname", 1)]))
+                        
+                        # Convert to list of tuples to match previous format
+                        members = [(m["fid"], m["nickname"], m["furnace_lv"]) for m in members]
                         
                         if not members:
                             await interaction.response.send_message(
@@ -742,11 +694,8 @@ class AllianceMemberOperations(commands.Cog):
 
                     alliances_with_counts = []
                     for alliance_id, name in alliances:
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                            member_count = cursor.fetchone()[0]
-                            alliances_with_counts.append((alliance_id, name, member_count))
+                        member_count = mongo.users.count_documents({"alliance": int(alliance_id)})
+                        alliances_with_counts.append((alliance_id, name, member_count))
 
                     view = AllianceSelectView(alliances_with_counts, self.cog)
                     
@@ -754,20 +703,15 @@ class AllianceMemberOperations(commands.Cog):
                         try:
                             source_alliance_id = int(view.current_select.values[0])
                             
-                            with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                                cursor = alliance_db.cursor()
-                                cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (source_alliance_id,))
-                                source_alliance_name = cursor.fetchone()[0]
+                            alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(source_alliance_id)})
+                            source_alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
                             
-                            with sqlite3.connect('db/users.sqlite') as users_db:
-                                cursor = users_db.cursor()
-                                cursor.execute("""
-                                    SELECT fid, nickname, furnace_lv 
-                                    FROM users 
-                                    WHERE alliance = ? 
-                                    ORDER BY furnace_lv DESC, nickname
-                                """, (source_alliance_id,))
-                                members = cursor.fetchall()
+                            members = list(mongo.users.find(
+                                {"alliance": int(source_alliance_id)},
+                                {"fid": 1, "nickname": 1, "furnace_lv": 1}
+                            ).sort([("furnace_lv", -1), ("nickname", 1)]))
+                            
+                            members = [(m["fid"], m["nickname"], m["furnace_lv"]) for m in members]
 
                             if not members:
                                 await interaction.response.send_message(
@@ -805,10 +749,8 @@ class AllianceMemberOperations(commands.Cog):
                             async def member_callback(member_interaction: discord.Interaction):
                                 selected_fid = int(member_view.current_select.values[0])
                                 
-                                with sqlite3.connect('db/users.sqlite') as users_db:
-                                    cursor = users_db.cursor()
-                                    cursor.execute("SELECT nickname FROM users WHERE fid = ?", (selected_fid,))
-                                    selected_member_name = cursor.fetchone()[0]
+                                user_doc = mongo.users.find_one({"fid": selected_fid})
+                                selected_member_name = user_doc["nickname"] if user_doc else "Unknown"
 
                                 
                                 target_embed = discord.Embed(
@@ -842,18 +784,13 @@ class AllianceMemberOperations(commands.Cog):
                                     target_alliance_id = int(target_select.values[0])
                                     
                                     try:
-                                        with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                                            cursor = alliance_db.cursor()
-                                            cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
-                                            target_alliance_name = cursor.fetchone()[0]
+                                        target_alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(target_alliance_id)})
+                                        target_alliance_name = target_alliance_doc["name"] if target_alliance_doc else "Unknown"
 
-                                        with sqlite3.connect('db/users.sqlite') as users_db:
-                                            cursor = users_db.cursor()
-                                            cursor.execute(
-                                                "UPDATE users SET alliance = ? WHERE fid = ?",
-                                                (target_alliance_id, selected_fid)
-                                            )
-                                            users_db.commit()
+                                        mongo.users.update_one(
+                                            {"fid": selected_fid},
+                                            {"$set": {"alliance": int(target_alliance_id)}}
+                                        )
 
                                         success_embed = discord.Embed(
                                             title="✅ Transfer Successful",
@@ -920,10 +857,9 @@ class AllianceMemberOperations(commands.Cog):
         await interaction.response.edit_message(embed=embed, view=view)
 
     async def add_user(self, interaction: discord.Interaction, alliance_id: str, ids: str):
-        self.c_alliance.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-        alliance_name = self.c_alliance.fetchone()
-        if alliance_name:
-            alliance_name = alliance_name[0]
+        alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+        if alliance_doc:
+            alliance_name = alliance_doc["name"]
         else:
             await interaction.response.send_message("Alliance not found.", ephemeral=True)
             return
@@ -998,11 +934,10 @@ class AllianceMemberOperations(commands.Cog):
         fids_to_process = []
         
         for fid in ids_list:
-            self.c_users.execute("SELECT nickname FROM users WHERE fid=?", (fid,))
-            existing = self.c_users.fetchone()
+            existing = mongo.users.find_one({"fid": int(fid)}, {"nickname": 1})
             if existing:
                 # Member already exists in database
-                already_in_db.append((fid, existing[0]))
+                already_in_db.append((fid, existing["nickname"]))
             else:
                 # Member doesn't exist at all
                 fids_to_process.append(fid)
@@ -1154,11 +1089,14 @@ class AllianceMemberOperations(commands.Cog):
 
                         if nickname:
                             try: # Since we pre-filtered, this FID should not exist in database
-                                self.c_users.execute("""
-                                    INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
-                                self.conn_users.commit()
+                                mongo.users.insert_one({
+                                    "fid": int(fid),
+                                    "nickname": nickname,
+                                    "furnace_lv": furnace_lv,
+                                    "kid": kid,
+                                    "stove_lv_content": stove_lv_content,
+                                    "alliance": int(alliance_id)
+                                })
                                 
                                 with open(self.log_file, 'a', encoding='utf-8') as f:
                                     f.write(f"[{timestamp}] Successfully added member - FID: {fid}, Nickname: {nickname}, Level: {furnace_lv}\n")
@@ -1175,7 +1113,7 @@ class AllianceMemberOperations(commands.Cog):
                                 )
                                 await message.edit(embed=embed)
                                 
-                            except sqlite3.IntegrityError as e:
+                            except pymongo.errors.DuplicateKeyError as e:
                                 # This shouldn't happen since we pre-filtered, but handle it just in case
                                 with open(log_file_path, 'a', encoding='utf-8') as log_file:
                                     log_file.write(f"ERROR: Member already exists (race condition?) - FID {fid}: {str(e)}\n")
@@ -1257,40 +1195,33 @@ class AllianceMemberOperations(commands.Cog):
             await message.edit(embed=embed)
 
             try:
-                with sqlite3.connect('db/settings.sqlite') as settings_db:
-                    cursor = settings_db.cursor()
-                    cursor.execute("""
-                        SELECT channel_id 
-                        FROM alliance_logs 
-                        WHERE alliance_id = ?
-                    """, (alliance_id,))
-                    alliance_log_result = cursor.fetchone()
-                    
-                    if alliance_log_result and alliance_log_result[0]:
-                        log_embed = discord.Embed(
-                            title="👥 Members Added to Alliance",
-                            description=(
-                                f"**Alliance:** {alliance_name}\n"
-                                f"**Administrator:** {interaction.user.name} (`{interaction.user.id}`)\n"
-                                f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                                f"**Results:**\n"
-                                f"✅ Successfully Added: {added_count}\n"
-                                f"❌ Failed: {error_count}\n"
-                                f"⚠️ Already Exists: {already_exists_count}\n\n"
-                                "**Added FIDs:**\n"
-                                f"```\n{', '.join(ids_list)}\n```"
-                            ),
-                            color=discord.Color.green()
-                        )
+                alliance_log_result = mongo.alliance_logs.find_one({"alliance_id": int(alliance_id)})
+                
+                if alliance_log_result and alliance_log_result.get("channel_id"):
+                    log_embed = discord.Embed(
+                        title="👥 Members Added to Alliance",
+                        description=(
+                            f"**Alliance:** {alliance_name}\n"
+                            f"**Administrator:** {interaction.user.name} (`{interaction.user.id}`)\n"
+                            f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                            f"**Results:**\n"
+                            f"✅ Successfully Added: {added_count}\n"
+                            f"❌ Failed: {error_count}\n"
+                            f"⚠️ Already Exists: {already_exists_count}\n\n"
+                            "**Added FIDs:**\n"
+                            f"```\n{', '.join(ids_list)}\n```"
+                        ),
+                        color=discord.Color.green()
+                    )
 
-                        try:
-                            alliance_channel_id = int(alliance_log_result[0])
-                            alliance_log_channel = self.bot.get_channel(alliance_channel_id)
-                            if alliance_log_channel:
-                                await alliance_log_channel.send(embed=log_embed)
-                        except Exception as e:
-                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                log_file.write(f"ERROR: Alliance Log Sending Error: {str(e)}\n")
+                    try:
+                        alliance_channel_id = int(alliance_log_result["channel_id"])
+                        alliance_log_channel = self.bot.get_channel(alliance_channel_id)
+                        if alliance_log_channel:
+                            await alliance_log_channel.send(embed=log_embed)
+                    except Exception as e:
+                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                            log_file.write(f"ERROR: Alliance Log Sending Error: {str(e)}\n")
 
             except Exception as e:
                 with open(log_file_path, 'a', encoding='utf-8') as log_file:
@@ -1328,83 +1259,47 @@ class AllianceMemberOperations(commands.Cog):
 
     async def is_admin(self, user_id):
         try:
-            with sqlite3.connect('db/settings.sqlite') as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id FROM admin WHERE id = ?", (user_id,))
-                result = cursor.fetchone()
-                is_admin = result is not None
-                return is_admin
+            admin = mongo.admin.find_one({"id": user_id})
+            return admin is not None
         except Exception as e:
             self.log_message(f"Error in admin check: {str(e)}")
             self.log_message(f"Error details: {str(e.__class__.__name__)}")
             return False
 
     def cog_unload(self):
-        self.conn_users.close()
-        self.conn_alliance.close()
+        pass
 
     async def get_admin_alliances(self, user_id: int, guild_id: int):
         try:
-            with sqlite3.connect('db/settings.sqlite') as settings_db:
-                cursor = settings_db.cursor()
-                cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (user_id,))
-                admin_result = cursor.fetchone()
-                
-                if not admin_result:
-                    self.log_message(f"User {user_id} is not an admin")
-                    return [], [], False
-                    
-                is_initial = admin_result[0]
-                
+            admin = mongo.admin.find_one({"id": user_id})
+            if not admin:
+                self.log_message(f"User {user_id} is not an admin")
+                return [], [], False
+            
+            is_initial = admin.get("is_initial", 0)
+            
             if is_initial == 1:
-                
-                with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                    cursor = alliance_db.cursor()
-                    cursor.execute("SELECT alliance_id, name FROM alliance_list ORDER BY name")
-                    alliances = cursor.fetchall()
-                    return alliances, [], True
+                alliances = list(mongo.alliance_list.find({}, {"alliance_id": 1, "name": 1}).sort("name", 1))
+                return [(a["alliance_id"], a["name"]) for a in alliances], [], True
             
-            server_alliances = []
+            server_alliances_docs = list(mongo.alliance_list.find({"discord_server_id": guild_id}, {"alliance_id": 1, "name": 1}).sort("name", 1))
+            server_alliances = [(a["alliance_id"], a["name"]) for a in server_alliances_docs]
+            
+            special_alliance_ids_docs = list(mongo.adminserver.find({"admin": user_id}, {"alliances_id": 1}))
+            special_alliance_ids = [d["alliances_id"] for d in special_alliance_ids_docs]
+            
             special_alliances = []
-            
-            with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                cursor = alliance_db.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT alliance_id, name 
-                    FROM alliance_list 
-                    WHERE discord_server_id = ?
-                    ORDER BY name
-                """, (guild_id,))
-                server_alliances = cursor.fetchall()
-            
-            with sqlite3.connect('db/settings.sqlite') as settings_db:
-                cursor = settings_db.cursor()
-                cursor.execute("""
-                    SELECT alliances_id 
-                    FROM adminserver 
-                    WHERE admin = ?
-                """, (user_id,))
-                special_alliance_ids = cursor.fetchall()
-                
             if special_alliance_ids:
-                with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                    cursor = alliance_db.cursor()
-                    placeholders = ','.join('?' * len(special_alliance_ids))
-                    cursor.execute(f"""
-                        SELECT DISTINCT alliance_id, name
-                        FROM alliance_list
-                        WHERE alliance_id IN ({placeholders})
-                        ORDER BY name
-                    """, [aid[0] for aid in special_alliance_ids])
-                    special_alliances = cursor.fetchall()
+                special_alliances_docs = list(mongo.alliance_list.find({"alliance_id": {"$in": special_alliance_ids}}, {"alliance_id": 1, "name": 1}).sort("name", 1))
+                special_alliances = [(a["alliance_id"], a["name"]) for a in special_alliances_docs]
             
-            all_alliances = list({(aid, name) for aid, name in (server_alliances + special_alliances)})
+            all_alliances = list(set(server_alliances + special_alliances))
             
             if not all_alliances and not special_alliances:
                 return [], [], False
             
             return all_alliances, special_alliances, False
-                
+            
         except Exception as e:
             return [], [], False
 
@@ -1583,28 +1478,23 @@ class FIDSearchModal(discord.ui.Modal):
                 return
             
             # Original transfer logic
-            with sqlite3.connect('db/users.sqlite') as users_db:
-                cursor = users_db.cursor()
-                cursor.execute("""
-                    SELECT fid, nickname, furnace_lv, alliance
-                    FROM users 
-                    WHERE fid = ?
-                """, (fid,))
-                user_result = cursor.fetchone()
-                
-                if not user_result:
-                    await interaction.response.send_message(
-                        "❌ No member with this FID was found.",
-                        ephemeral=True
-                    )
-                    return
+            # Original transfer logic
+            user_doc = mongo.users.find_one({"fid": int(fid)})
+            
+            if not user_doc:
+                await interaction.response.send_message(
+                    "❌ No member with this FID was found.",
+                    ephemeral=True
+                )
+                return
 
-                fid, nickname, furnace_lv, current_alliance_id = user_result
+            fid = user_doc["fid"]
+            nickname = user_doc["nickname"]
+            furnace_lv = user_doc["furnace_lv"]
+            current_alliance_id = user_doc["alliance"]
  
-                with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                    cursor = alliance_db.cursor()
-                    cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (current_alliance_id,))
-                    current_alliance_name = cursor.fetchone()[0]
+            alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(current_alliance_id)})
+            current_alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
 
                 embed = discord.Embed(
                     title="✅ Member Found - Transfer Process",
@@ -1640,19 +1530,13 @@ class FIDSearchModal(discord.ui.Modal):
                     target_alliance_id = int(select.values[0])
                     
                     try:
-                        with sqlite3.connect('db/alliance.sqlite') as alliance_db:
-                            cursor = alliance_db.cursor()
-                            cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
-                            target_alliance_name = cursor.fetchone()[0]
+                        target_alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(target_alliance_id)})
+                        target_alliance_name = target_alliance_doc["name"] if target_alliance_doc else "Unknown"
 
-                        
-                        with sqlite3.connect('db/users.sqlite') as users_db:
-                            cursor = users_db.cursor()
-                            cursor.execute(
-                                "UPDATE users SET alliance = ? WHERE fid = ?",
-                                (target_alliance_id, fid)
-                            )
-                            users_db.commit()
+                        mongo.users.update_one(
+                            {"fid": int(fid)},
+                            {"$set": {"alliance": int(target_alliance_id)}}
+                        )
 
                         
                         success_embed = discord.Embed(
