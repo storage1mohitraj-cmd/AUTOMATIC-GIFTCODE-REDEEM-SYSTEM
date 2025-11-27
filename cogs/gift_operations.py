@@ -111,6 +111,15 @@ class GiftOperations(commands.Cog):
             # Column already exists
             pass
 
+        # Gift Code Redemption Status Channels Table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS giftcode_redeem_status_channels (
+                alliance_id INTEGER PRIMARY KEY,
+                channel_id INTEGER
+            )
+        """)
+        self.conn.commit()
+
         # Add validation_status column to gift_codes table if it doesn't exist
         try:
             self.cursor.execute("ALTER TABLE gift_codes ADD COLUMN validation_status TEXT DEFAULT 'pending'")
@@ -2362,6 +2371,52 @@ class GiftOperations(commands.Cog):
             pass
         except Exception:
             pass
+    
+    async def show_redeem_status_channel_menu(self, interaction: discord.Interaction):
+        """Show the redemption status channel configuration menu"""
+        try:
+            # Check admin permissions
+            self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
+            admin_result = self.settings_cursor.fetchone()
+            
+            if not admin_result:
+                await interaction.response.send_message(
+                    "❌ You don't have permission to use this feature.",
+                    ephemeral=True
+                )
+                return
+            
+            embed = discord.Embed(
+                title="📢 Gift Code Redemption Status Channels",
+                description=(
+                    "Configure channels to receive automatic gift code redemption notifications.\n\n"
+                    "**Available Operations**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📢 **Set Status Channel**\n"
+                    "└ Configure a channel for an alliance\n\n"
+                    "📋 **View Status Channels**\n"
+                    "└ List all configured channels\n\n"
+                    "🗑️ **Remove Status Channel**\n"
+                    "└ Remove channel configuration\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "When gift codes are automatically redeemed, a summary will be posted to the configured channel."
+                ),
+                color=discord.Color.blue()
+            )
+            
+            view = RedeemStatusChannelView(self)
+            await interaction.response.edit_message(embed=embed, view=view)
+            
+        except discord.InteractionResponded:
+            pass
+        except Exception as e:
+            self.logger.exception(f"Error showing redemption status channel menu: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ An error occurred while loading the menu.",
+                    ephemeral=True
+                )
+
 
     async def create_gift_code(self, interaction: discord.Interaction):
         self.settings_cursor.execute("SELECT 1 FROM admin WHERE id = ?", (interaction.user.id,))
@@ -4162,6 +4217,52 @@ class GiftOperations(commands.Cog):
                 self.batch_process_alliance_results(batch_results)
                 batch_results = []
             
+            # Send redemption status notification to configured channel
+            try:
+                self.cursor.execute("SELECT channel_id FROM giftcode_redeem_status_channels WHERE alliance_id = ?", (alliance_id,))
+                status_channel_result = self.cursor.fetchone()
+                
+                if status_channel_result:
+                    status_channel_id = status_channel_result[0]
+                    status_channel = self.bot.get_channel(status_channel_id)
+                    
+                    if status_channel:
+                        # Determine embed color based on results
+                        if failed_count == 0 and success_count > 0:
+                            notification_color = discord.Color.green()
+                            status_emoji = "✅"
+                        elif success_count > 0:
+                            notification_color = discord.Color.orange()
+                            status_emoji = "⚠️"
+                        else:
+                            notification_color = discord.Color.red()
+                            status_emoji = "❌"
+                        
+                        notification_embed = discord.Embed(
+                            title=f"{status_emoji} Gift Code Redemption Complete",
+                            description=(
+                                f"**Gift Code Redemption Summary**\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🎁 **Gift Code:** `{giftcode}`\n"
+                                f"🏰 **Alliance:** `{alliance_name}`\n"
+                                f"👥 **Total Members:** `{total_members}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"✅ **Successfully Redeemed:** `{success_count}`\n"
+                                f"ℹ️ **Already Redeemed:** `{received_count}`\n"
+                                f"❌ **Failed:** `{failed_count}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"⏰ **Completed:** <t:{int(datetime.now().timestamp())}:R>\n"
+                            ),
+                            color=notification_color
+                        )
+                        
+                        await status_channel.send(embed=notification_embed)
+                        self.logger.info(f"Sent redemption status notification for {giftcode} to channel {status_channel_id}")
+                    else:
+                        self.logger.warning(f"Status channel {status_channel_id} not found for alliance {alliance_id}")
+            except Exception as e:
+                self.logger.exception(f"Error sending redemption status notification: {e}")
+            
             return True
         
         except Exception as e:
@@ -4413,6 +4514,16 @@ class GiftView(discord.ui.View):
     )
     async def gift_code_settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.show_settings_menu(interaction)
+    
+    @discord.ui.button(
+        label="Redemption Status Channel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="redeem_status_channel",
+        emoji="📢",
+        row=2
+    )
+    async def redeem_status_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.show_redeem_status_channel_menu(interaction)
 
     @discord.ui.button(
         label="List Gift Codes",
@@ -5215,6 +5326,269 @@ class OCRSettingsView(discord.ui.View):
         else:
             self.cog.logger.error(f"OCR settings update failed: {message_from_task}")
             await progress_message.edit(content=f"❌ {message_from_task}")
+
+class RedeemStatusChannelView(discord.ui.View):
+    """View for managing gift code redemption status channels"""
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+    
+    @discord.ui.button(
+        label="Set Status Channel",
+        emoji="📢",
+        style=discord.ButtonStyle.success,
+        custom_id="set_redeem_status_channel",
+        row=0
+    )
+    async def set_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Get all alliances
+            self.cog.alliance_cursor.execute("SELECT alliance_id, name FROM alliance_list")
+            alliances = self.cog.alliance_cursor.fetchall()
+            
+            if not alliances:
+                await interaction.response.send_message(
+                    "❌ No alliances found.",
+                    ephemeral=True
+                )
+                return
+            
+            # Create alliance selection dropdown
+            options = [
+                discord.SelectOption(
+                    label=name,
+                    value=str(alliance_id),
+                    description=f"Alliance ID: {alliance_id}"
+                ) for alliance_id, name in alliances
+            ]
+            
+            class AllianceSelect(discord.ui.Select):
+                def __init__(self):
+                    super().__init__(
+                        placeholder="Select an alliance",
+                        options=options,
+                        custom_id="alliance_select_redeem_status"
+                    )
+                
+                async def callback(self, select_interaction: discord.Interaction):
+                    alliance_id = int(self.values[0])
+                    alliance_name = dict(alliances)[alliance_id]
+                    
+                    # Create channel selection dropdown
+                    class ChannelSelect(discord.ui.ChannelSelect):
+                        def __init__(self):
+                            super().__init__(
+                                placeholder="Select a channel for status notifications",
+                                channel_types=[discord.ChannelType.text]
+                            )
+                        
+                        async def callback(self, channel_interaction: discord.Interaction):
+                            selected_channel = self.values[0]
+                            
+                            try:
+                                # Save to database
+                                self.view.cog.cursor.execute("""
+                                    INSERT OR REPLACE INTO giftcode_redeem_status_channels 
+                                    (alliance_id, channel_id) VALUES (?, ?)
+                                """, (alliance_id, selected_channel.id))
+                                self.view.cog.conn.commit()
+                                
+                                success_embed = discord.Embed(
+                                    title="✅ Status Channel Set",
+                                    description=(
+                                        f"**Redemption status notifications configured:**\n\n"
+                                        f"🏰 **Alliance:** {alliance_name}\n"
+                                        f"📢 **Channel:** {selected_channel.mention}\n\n"
+                                        f"When gift codes are automatically redeemed for this alliance, "
+                                        f"a summary will be posted to this channel."
+                                    ),
+                                    color=discord.Color.green()
+                                )
+                                await channel_interaction.response.edit_message(embed=success_embed, view=None)
+                            except Exception as e:
+                                error_embed = discord.Embed(
+                                    title="❌ Error",
+                                    description=f"An error occurred while setting the status channel: {str(e)}",
+                                    color=discord.Color.red()
+                                )
+                                await channel_interaction.response.edit_message(embed=error_embed, view=None)
+                    
+                    channel_view = discord.ui.View()
+                    channel_view.cog = self.view.cog
+                    channel_view.add_item(ChannelSelect())
+                    
+                    channel_embed = discord.Embed(
+                        title="📢 Select Status Channel",
+                        description=f"Select a channel to receive redemption status notifications for **{alliance_name}**:",
+                        color=discord.Color.blue()
+                    )
+                    await select_interaction.response.edit_message(embed=channel_embed, view=channel_view)
+            
+            alliance_view = discord.ui.View()
+            alliance_view.cog = self.cog
+            alliance_view.add_item(AllianceSelect())
+            
+            alliance_embed = discord.Embed(
+                title="🏰 Select Alliance",
+                description="Select an alliance to configure its redemption status channel:",
+                color=discord.Color.blue()
+            )
+            await interaction.response.send_message(embed=alliance_embed, view=alliance_view, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ An error occurred: {str(e)}",
+                ephemeral=True
+            )
+    
+    @discord.ui.button(
+        label="View Status Channels",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="view_redeem_status_channels",
+        row=0
+    )
+    async def view_channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Get all configured status channels
+            self.cog.cursor.execute("SELECT alliance_id, channel_id FROM giftcode_redeem_status_channels")
+            status_channels = self.cog.cursor.fetchall()
+            
+            if not status_channels:
+                await interaction.response.send_message(
+                    "❌ No redemption status channels configured.",
+                    ephemeral=True
+                )
+                return
+            
+            embed = discord.Embed(
+                title="📋 Redemption Status Channels",
+                description="Configured channels for gift code redemption notifications:",
+                color=discord.Color.blue()
+            )
+            
+            for alliance_id, channel_id in status_channels:
+                # Get alliance name
+                self.cog.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
+                alliance_result = self.cog.alliance_cursor.fetchone()
+                alliance_name = alliance_result[0] if alliance_result else f"Alliance {alliance_id}"
+                
+                # Get channel
+                channel = interaction.guild.get_channel(channel_id)
+                channel_mention = channel.mention if channel else f"Channel {channel_id} (not found)"
+                
+                embed.add_field(
+                    name=f"🏰 {alliance_name}",
+                    value=f"📢 {channel_mention}",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ An error occurred: {str(e)}",
+                ephemeral=True
+            )
+    
+    @discord.ui.button(
+        label="Remove Status Channel",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="remove_redeem_status_channel",
+        row=1
+    )
+    async def remove_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Get all configured status channels
+            self.cog.cursor.execute("SELECT alliance_id FROM giftcode_redeem_status_channels")
+            configured_alliances = [row[0] for row in self.cog.cursor.fetchall()]
+            
+            if not configured_alliances:
+                await interaction.response.send_message(
+                    "❌ No redemption status channels configured.",
+                    ephemeral=True
+                )
+                return
+            
+            # Get alliance names
+            alliance_options = []
+            for alliance_id in configured_alliances:
+                self.cog.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
+                alliance_result = self.cog.alliance_cursor.fetchone()
+                if alliance_result:
+                    alliance_options.append((alliance_id, alliance_result[0]))
+            
+            if not alliance_options:
+                await interaction.response.send_message(
+                    "❌ No valid alliances found.",
+                    ephemeral=True
+                )
+                return
+            
+            # Create alliance selection dropdown
+            options = [
+                discord.SelectOption(
+                    label=name,
+                    value=str(alliance_id),
+                    description=f"Alliance ID: {alliance_id}"
+                ) for alliance_id, name in alliance_options
+            ]
+            
+            class AllianceRemoveSelect(discord.ui.Select):
+                def __init__(self):
+                    super().__init__(
+                        placeholder="Select an alliance to remove",
+                        options=options,
+                        custom_id="alliance_remove_select"
+                    )
+                
+                async def callback(self, select_interaction: discord.Interaction):
+                    alliance_id = int(self.values[0])
+                    alliance_name = dict(alliance_options)[alliance_id]
+                    
+                    try:
+                        # Remove from database
+                        self.view.cog.cursor.execute(
+                            "DELETE FROM giftcode_redeem_status_channels WHERE alliance_id = ?",
+                            (alliance_id,)
+                        )
+                        self.view.cog.conn.commit()
+                        
+                        success_embed = discord.Embed(
+                            title="✅ Status Channel Removed",
+                            description=(
+                                f"**Redemption status notifications disabled:**\n\n"
+                                f"🏰 **Alliance:** {alliance_name}\n\n"
+                                f"This alliance will no longer receive redemption status notifications."
+                            ),
+                            color=discord.Color.green()
+                        )
+                        await select_interaction.response.edit_message(embed=success_embed, view=None)
+                    except Exception as e:
+                        error_embed = discord.Embed(
+                            title="❌ Error",
+                            description=f"An error occurred while removing the status channel: {str(e)}",
+                            color=discord.Color.red()
+                        )
+                        await select_interaction.response.edit_message(embed=error_embed, view=None)
+            
+            remove_view = discord.ui.View()
+            remove_view.cog = self.cog
+            remove_view.add_item(AllianceRemoveSelect())
+            
+            remove_embed = discord.Embed(
+                title="🗑️ Remove Status Channel",
+                description="Select an alliance to remove its redemption status channel:",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=remove_embed, view=remove_view, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ An error occurred: {str(e)}",
+                ephemeral=True
+            )
 
 async def setup(bot):
     await bot.add_cog(GiftOperations(bot)) 
