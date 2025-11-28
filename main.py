@@ -5,7 +5,10 @@ import shutil
 import stat
 
 def is_container() -> bool:
-    return os.path.exists("/.dockerenv") or os.path.exists("/var/run/secrets/kubernetes.io")
+    return (os.path.exists("/.dockerenv") or 
+            os.path.exists("/var/run/secrets/kubernetes.io") or
+            os.getenv("RENDER") is not None or 
+            os.getenv("RENDER_SERVICE_NAME") is not None)
 
 def is_ci_environment() -> bool:
     """Check if running in a CI environment"""
