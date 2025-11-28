@@ -664,9 +664,14 @@ if __name__ == "__main__":
                     if "--autoupdate" in sys.argv or repair_mode:
                         update = True
                     else:
+                    else:
                         print("Note: If your terminal is not interactive, you can use the --autoupdate argument to skip this prompt.")
-                        ask = input("Do you want to update? (y/n): ").strip().lower()
-                        update = ask == "y"
+                        try:
+                            ask = input("Do you want to update? (y/n): ").strip().lower()
+                            update = ask == "y"
+                        except EOFError:
+                            print(F.YELLOW + "Non-interactive environment detected (EOF). Auto-accepting update." + R)
+                            update = True
                 else:
                     print(F.YELLOW + "Running in a container. Skipping update prompt." + R)
                     update = True
