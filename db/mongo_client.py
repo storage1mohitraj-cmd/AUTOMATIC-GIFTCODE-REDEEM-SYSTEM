@@ -1,8 +1,10 @@
 import os
 from typing import Optional
+import certifi
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.server_api import ServerApi
 
 
 _client: Optional[MongoClient] = None
@@ -46,7 +48,9 @@ def get_client() -> MongoClient:
         slash_params = f"/?{params}" if params else ""
         uri = f"mongodb://{auth_part}{host}{slash_params}"
 
-    _client = MongoClient(uri)
+    # Use tlsInsecure=True to bypass certificate and hostname validation
+    # Use ServerApi('1') for better compatibility
+    _client = MongoClient(uri, server_api=ServerApi('1'), tls=True, tlsInsecure=True)
     return _client
 
 

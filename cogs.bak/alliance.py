@@ -1,44 +1,15 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import sqlite3  
+from db.mongo_adapter import mongo  
 import asyncio
 from datetime import datetime
 
 class Alliance(commands.Cog):
-    def __init__(self, bot, conn):
+    def __init__(self, bot):
         self.bot = bot
-        self.conn = conn
-        self.c = self.conn.cursor()
-        
-        self.conn_users = sqlite3.connect('db/users.sqlite')
-        self.c_users = self.conn_users.cursor()
-        
-        self.conn_settings = sqlite3.connect('db/settings.sqlite')
-        self.c_settings = self.conn_settings.cursor()
-        
-        self.conn_giftcode = sqlite3.connect('db/giftcode.sqlite')
-        self.c_giftcode = self.conn_giftcode.cursor()
 
-        self._create_table()
-        self._check_and_add_column()
 
-    def _create_table(self):
-        self.c.execute("""
-            CREATE TABLE IF NOT EXISTS alliance_list (
-                alliance_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                discord_server_id INTEGER
-            )
-        """)
-        self.conn.commit()
-
-    def _check_and_add_column(self):
-        self.c.execute("PRAGMA table_info(alliance_list)")
-        columns = [info[1] for info in self.c.fetchall()]
-        if "discord_server_id" not in columns:
-            self.c.execute("ALTER TABLE alliance_list ADD COLUMN discord_server_id INTEGER")
-            self.conn.commit()
 
     async def view_alliances(self, interaction: discord.Interaction):
         
@@ -47,42 +18,46 @@ class Alliance(commands.Cog):
             return
 
         user_id = interaction.user.id
-        self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
-        admin = self.c_settings.fetchone()
+        user_id = interaction.user.id
+        admin = mongo.admin.find_one({"id": user_id})
 
         if admin is None:
             await interaction.response.send_message("You do not have permission to view alliances.", ephemeral=True)
             return
 
-        is_initial = admin[1]
+        is_initial = admin.get("is_initial", 0)
         guild_id = interaction.guild.id
 
         try:
-            if is_initial == 1:
-                query = """
-                    SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval
-                    FROM alliance_list a
-                    LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-                    ORDER BY a.alliance_id ASC
-                """
-                self.c.execute(query)
-            else:
-                query = """
-                    SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval
-                    FROM alliance_list a
-                    LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-                    WHERE a.discord_server_id = ?
-                    ORDER BY a.alliance_id ASC
-                """
-                self.c.execute(query, (guild_id,))
+            pipeline = []
+            if is_initial != 1:
+                pipeline.append({"$match": {"discord_server_id": guild_id}})
+            
+            pipeline.extend([
+                {"$lookup": {
+                    "from": "alliancesettings",
+                    "localField": "alliance_id",
+                    "foreignField": "alliance_id",
+                    "as": "settings"
+                }},
+                {"$unwind": {"path": "$settings", "preserveNullAndEmptyArrays": True}},
+                {"$sort": {"alliance_id": 1}},
+                {"$project": {
+                    "alliance_id": 1,
+                    "name": 1,
+                    "interval": {"$ifNull": ["$settings.interval", 0]}
+                }}
+            ])
 
-            alliances = self.c.fetchall()
+            alliances = list(mongo.alliance_list.aggregate(pipeline))
 
             alliance_list = ""
-            for alliance_id, name, interval in alliances:
+            for alliance in alliances:
+                alliance_id = alliance["alliance_id"]
+                name = alliance["name"]
+                interval = alliance["interval"]
                 
-                self.c_users.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                member_count = self.c_users.fetchone()[0]
+                member_count = mongo.users.count_documents({"alliance": alliance_id})
                 
                 interval_text = f"{interval} minutes" if interval > 0 else "No automatic control"
                 alliance_list += f"🛡️ **{alliance_id}: {name}**\n👥 Members: {member_count}\n⏱️ Control Interval: {interval_text}\n\n"
@@ -104,11 +79,10 @@ class Alliance(commands.Cog):
             )
 
     async def alliance_autocomplete(self, interaction: discord.Interaction, current: str):
-        self.c.execute("SELECT alliance_id, name FROM alliance_list")
-        alliances = self.c.fetchall()
+        alliances = list(mongo.alliance_list.find({}, {"alliance_id": 1, "name": 1}))
         return [
-            app_commands.Choice(name=f"{name} (ID: {alliance_id})", value=str(alliance_id))
-            for alliance_id, name in alliances if current.lower() in name.lower()
+            app_commands.Choice(name=f"{alliance['name']} (ID: {alliance['alliance_id']})", value=str(alliance['alliance_id']))
+            for alliance in alliances if current.lower() in alliance['name'].lower()
         ][:25]
 
     @app_commands.command(name="settings", description="Open settings menu.")
@@ -124,17 +98,12 @@ class Alliance(commands.Cog):
                     )
                     return
                 
-            self.c_settings.execute("SELECT COUNT(*) FROM admin")
-            admin_count = self.c_settings.fetchone()[0]
+            admin_count = mongo.admin.count_documents({})
 
             user_id = interaction.user.id
 
             if admin_count == 0:
-                self.c_settings.execute("""
-                    INSERT INTO admin (id, is_initial) 
-                    VALUES (?, 1)
-                """, (user_id,))
-                self.conn_settings.commit()
+                mongo.admin.insert_one({"id": user_id, "is_initial": 1})
 
                 first_use_embed = discord.Embed(
                     title="🎉 First Time Setup",
@@ -149,8 +118,7 @@ class Alliance(commands.Cog):
                 
                 await asyncio.sleep(3)
                 
-            self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
-            admin = self.c_settings.fetchone()
+            admin = mongo.admin.find_one({"id": user_id})
 
             if admin is None:
                 await interaction.response.send_message(
@@ -252,8 +220,8 @@ class Alliance(commands.Cog):
         if interaction.type == discord.InteractionType.component:
             custom_id = interaction.data.get("custom_id")
             user_id = interaction.user.id
-            self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
-            admin = self.c_settings.fetchone()
+            user_id = interaction.user.id
+            admin = mongo.admin.find_one({"id": user_id})
 
             if admin is None:
                 await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
@@ -286,21 +254,21 @@ class Alliance(commands.Cog):
                         emoji="➕",
                         style=discord.ButtonStyle.success, 
                         custom_id="add_alliance", 
-                        disabled=admin[1] != 1
+                        disabled=admin.get("is_initial", 0) != 1
                     ))
                     view.add_item(discord.ui.Button(
                         label="Edit Alliance", 
                         emoji="✏️",
                         style=discord.ButtonStyle.primary, 
                         custom_id="edit_alliance", 
-                        disabled=admin[1] != 1
+                        disabled=admin.get("is_initial", 0) != 1
                     ))
                     view.add_item(discord.ui.Button(
                         label="Delete Alliance", 
                         emoji="🗑️",
                         style=discord.ButtonStyle.danger, 
                         custom_id="delete_alliance", 
-                        disabled=admin[1] != 1
+                        disabled=admin.get("is_initial", 0) != 1
                     ))
                     view.add_item(discord.ui.Button(
                         label="View Alliances", 
@@ -324,19 +292,28 @@ class Alliance(commands.Cog):
                     await interaction.response.edit_message(embed=embed, view=view)
 
                 elif custom_id == "edit_alliance":
-                    if admin[1] != 1:
+                    if admin.get("is_initial", 0) != 1:
                         await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
                         return
                     await self.edit_alliance(interaction)
 
                 elif custom_id == "check_alliance":
-                    self.c.execute("""
-                        SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval
-                        FROM alliance_list a
-                        LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-                        ORDER BY a.name
-                    """)
-                    alliances = self.c.fetchall()
+                    pipeline = [
+                        {"$lookup": {
+                            "from": "alliancesettings",
+                            "localField": "alliance_id",
+                            "foreignField": "alliance_id",
+                            "as": "settings"
+                        }},
+                        {"$unwind": {"path": "$settings", "preserveNullAndEmptyArrays": True}},
+                        {"$sort": {"name": 1}},
+                        {"$project": {
+                            "alliance_id": 1,
+                            "name": 1,
+                            "interval": {"$ifNull": ["$settings.interval", 0]}
+                        }}
+                    ]
+                    alliances = list(mongo.alliance_list.aggregate(pipeline))
 
                     if not alliances:
                         await interaction.response.send_message("No alliances found to check.", ephemeral=True)
@@ -353,10 +330,10 @@ class Alliance(commands.Cog):
                     
                     options.extend([
                         discord.SelectOption(
-                            label=f"{name[:40]}",
-                            value=str(alliance_id),
-                            description=f"Control Interval: {interval} minutes"
-                        ) for alliance_id, name, interval in alliances
+                            label=f"{alliance['name'][:40]}",
+                            value=str(alliance['alliance_id']),
+                            description=f"Control Interval: {alliance['interval']} minutes"
+                        ) for alliance in alliances
                     ])
 
                     select = discord.ui.Select(
@@ -399,13 +376,13 @@ class Alliance(commands.Cog):
 
                                 # Queue all alliance operations at once
                                 queued_alliances = []
-                                for index, (alliance_id, name, _) in enumerate(alliances):
+                                for index, alliance in enumerate(alliances):
+                                    alliance_id = alliance['alliance_id']
+                                    name = alliance['name']
                                     try:
-                                        self.c.execute("""
-                                            SELECT channel_id FROM alliancesettings WHERE alliance_id = ?
-                                        """, (alliance_id,))
-                                        channel_data = self.c.fetchone()
-                                        channel = self.bot.get_channel(channel_data[0]) if channel_data else select_interaction.channel
+                                        channel_data = mongo.alliancesettings.find_one({"alliance_id": alliance_id})
+                                        channel_id = channel_data.get("channel_id") if channel_data else None
+                                        channel = self.bot.get_channel(channel_id) if channel_id else select_interaction.channel
                                         
                                         await control_cog.login_handler.queue_operation({
                                             'type': 'alliance_control',
@@ -490,22 +467,22 @@ class Alliance(commands.Cog):
                                 )
                                 await msg.edit(embed=queue_complete_embed)
                             
+
                             else:
                                 alliance_id = int(selected_value)
-                                self.c.execute("""
-                                    SELECT a.name, s.channel_id 
-                                    FROM alliance_list a
-                                    LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-                                    WHERE a.alliance_id = ?
-                                """, (alliance_id,))
-                                alliance_data = self.c.fetchone()
-
-                                if not alliance_data:
+                                
+                                alliance_doc = mongo.alliance_list.find_one({"alliance_id": alliance_id})
+                                settings_doc = mongo.alliancesettings.find_one({"alliance_id": alliance_id})
+                                
+                                if not alliance_doc:
                                     await select_interaction.response.send_message("Alliance not found.", ephemeral=True)
                                     return
 
-                                alliance_name, channel_id = alliance_data
+                                alliance_name = alliance_doc["name"]
+                                channel_id = settings_doc.get("channel_id") if settings_doc else None
                                 channel = self.bot.get_channel(channel_id) if channel_id else select_interaction.channel
+
+
                                 
                                 status_embed = discord.Embed(
                                     title="🔍 Alliance Control",
@@ -608,13 +585,13 @@ class Alliance(commands.Cog):
                             )
 
                 elif custom_id == "add_alliance":
-                    if admin[1] != 1:
+                    if admin.get("is_initial", 0) != 1:
                         await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
                         return
                     await self.add_alliance(interaction)
 
                 elif custom_id == "delete_alliance":
-                    if admin[1] != 1:
+                    if admin.get("is_initial", 0) != 1:
                         await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
                         return
                     await self.delete_alliance(interaction)
@@ -728,8 +705,7 @@ class Alliance(commands.Cog):
 
             async def channel_select_callback(select_interaction: discord.Interaction):
                 try:
-                    self.c.execute("SELECT alliance_id FROM alliance_list WHERE name = ?", (alliance_name,))
-                    existing_alliance = self.c.fetchone()
+                    existing_alliance = mongo.alliance_list.find_one({"name": alliance_name})
                     
                     if existing_alliance:
                         error_embed = discord.Embed(
@@ -742,18 +718,26 @@ class Alliance(commands.Cog):
 
                     channel_id = int(select_interaction.data["values"][0])
 
-                    self.c.execute("INSERT INTO alliance_list (name, discord_server_id) VALUES (?, ?)", 
-                                 (alliance_name, interaction.guild.id))
-                    alliance_id = self.c.lastrowid
-                    self.c.execute("INSERT INTO alliancesettings (alliance_id, channel_id, interval) VALUES (?, ?, ?)", 
-                                 (alliance_id, channel_id, interval))
-                    self.conn.commit()
+                    # Generate new ID
+                    last_alliance = mongo.alliance_list.find_one(sort=[("alliance_id", -1)])
+                    alliance_id = (last_alliance["alliance_id"] + 1) if last_alliance else 1
 
-                    self.c_giftcode.execute("""
-                        INSERT INTO giftcodecontrol (alliance_id, status) 
-                        VALUES (?, 1)
-                    """, (alliance_id,))
-                    self.conn_giftcode.commit()
+                    mongo.alliance_list.insert_one({
+                        "alliance_id": alliance_id,
+                        "name": alliance_name,
+                        "discord_server_id": interaction.guild.id
+                    })
+                    
+                    mongo.alliancesettings.insert_one({
+                        "alliance_id": alliance_id,
+                        "channel_id": channel_id,
+                        "interval": interval
+                    })
+
+                    mongo.giftcodecontrol.insert_one({
+                        "alliance_id": alliance_id,
+                        "status": 1
+                    })
 
                     result_embed = discord.Embed(
                         title="✅ Alliance Successfully Created",
@@ -802,21 +786,27 @@ class Alliance(commands.Cog):
             await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
 
     async def edit_alliance(self, interaction: discord.Interaction):
-        self.c.execute("""
-            SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval, COALESCE(s.channel_id, 0) as channel_id 
-            FROM alliance_list a 
-            LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-            ORDER BY a.alliance_id ASC
-        """)
-        alliances = self.c.fetchall()
-        
+        pipeline = [
+            {"$lookup": {
+                "from": "alliancesettings",
+                "localField": "alliance_id",
+                "foreignField": "alliance_id",
+                "as": "settings"
+            }},
+            {"$unwind": {"path": "$settings", "preserveNullAndEmptyArrays": True}},
+            {"$sort": {"name": 1}},
+            {"$project": {
+                "alliance_id": 1,
+                "name": 1,
+                "interval": {"$ifNull": ["$settings.interval", 0]}
+            }}
+        ]
+        alliances = list(mongo.alliance_list.aggregate(pipeline))
+
         if not alliances:
             no_alliance_embed = discord.Embed(
                 title="❌ No Alliances Found",
-                description=(
-                    "There are no alliances registered in the database.\n"
-                    "Please create an alliance first using the `/alliance create` command."
-                ),
+                description="There are no alliances to edit.",
                 color=discord.Color.red()
             )
             no_alliance_embed.set_footer(text="Use /alliance create to add a new alliance")
@@ -824,10 +814,10 @@ class Alliance(commands.Cog):
 
         alliance_options = [
             discord.SelectOption(
-                label=f"{name} (ID: {alliance_id})",
-                value=f"{alliance_id}",
-                description=f"Interval: {interval} minutes"
-            ) for alliance_id, name, interval, _ in alliances
+                label=f"{alliance['name']} (ID: {alliance['alliance_id']})",
+                value=f"{alliance['alliance_id']}",
+                description=f"Interval: {alliance['interval']} minutes"
+            ) for alliance in alliances
         ]
         
         items_per_page = 25
@@ -906,19 +896,16 @@ class Alliance(commands.Cog):
         async def select_callback(select_interaction: discord.Interaction):
             try:
                 alliance_id = int(select_interaction.data["values"][0])
-                alliance_data = next(a for a in alliances if a[0] == alliance_id)
+                alliance_data = next(a for a in alliances if a['alliance_id'] == alliance_id)
                 
-                self.c.execute("""
-                    SELECT interval, channel_id 
-                    FROM alliancesettings 
-                    WHERE alliance_id = ?
-                """, (alliance_id,))
-                settings_data = self.c.fetchone()
+                settings_data = mongo.alliancesettings.find_one({"alliance_id": alliance_id})
+                interval = settings_data.get("interval", 0) if settings_data else 0
+                current_channel_id = settings_data.get("channel_id") if settings_data else None
                 
                 modal = AllianceModal(
                     title="Edit Alliance",
-                    default_name=alliance_data[1],
-                    default_interval=str(settings_data[0] if settings_data else 0)
+                    default_name=alliance_data['name'],
+                    default_interval=str(interval)
                 )
                 await select_interaction.response.send_modal(modal)
                 await modal.wait()
@@ -932,7 +919,7 @@ class Alliance(commands.Cog):
                         description=(
                             "**Current Channel Information**\n"
                             "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📢 Current channel: {f'<#{settings_data[1]}>' if settings_data else 'Not set'}\n"
+                            f"📢 Current channel: {f'<#{current_channel_id}>' if current_channel_id else 'Not set'}\n"
                             "**Page:** 1/1\n"
                             f"**Total Channels:** {len(interaction.guild.text_channels)}\n"
                             "━━━━━━━━━━━━━━━━━━━━━━"
@@ -944,22 +931,16 @@ class Alliance(commands.Cog):
                         try:
                             channel_id = int(channel_interaction.data["values"][0])
 
-                            self.c.execute("UPDATE alliance_list SET name = ? WHERE alliance_id = ?", 
-                                          (alliance_name, alliance_id))
+                            mongo.alliance_list.update_one(
+                                {"alliance_id": alliance_id},
+                                {"$set": {"name": alliance_name}}
+                            )
                             
-                            if settings_data:
-                                self.c.execute("""
-                                    UPDATE alliancesettings 
-                                    SET channel_id = ?, interval = ? 
-                                    WHERE alliance_id = ?
-                                """, (channel_id, interval, alliance_id))
-                            else:
-                                self.c.execute("""
-                                    INSERT INTO alliancesettings (alliance_id, channel_id, interval)
-                                    VALUES (?, ?, ?)
-                                """, (alliance_id, channel_id, interval))
-                            
-                            self.conn.commit()
+                            mongo.alliancesettings.update_one(
+                                {"alliance_id": alliance_id},
+                                {"$set": {"channel_id": channel_id, "interval": interval}},
+                                upsert=True
+                            )
 
                             result_embed = discord.Embed(
                                 title="✅ Alliance Successfully Updated",
@@ -1039,8 +1020,7 @@ class Alliance(commands.Cog):
 
     async def delete_alliance(self, interaction: discord.Interaction):
         try:
-            self.c.execute("SELECT alliance_id, name FROM alliance_list ORDER BY name")
-            alliances = self.c.fetchall()
+            alliances = list(mongo.alliance_list.find({}, {"alliance_id": 1, "name": 1}).sort("name", 1))
             
             if not alliances:
                 no_alliance_embed = discord.Embed(
@@ -1052,19 +1032,19 @@ class Alliance(commands.Cog):
                 return
 
             alliance_members = {}
-            for alliance_id, _ in alliances:
-                self.c_users.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                member_count = self.c_users.fetchone()[0]
+            for alliance in alliances:
+                alliance_id = alliance["alliance_id"]
+                member_count = mongo.users.count_documents({"alliance": alliance_id})
                 alliance_members[alliance_id] = member_count
 
             items_per_page = 25
             all_options = [
                 discord.SelectOption(
-                    label=f"{name[:40]} (ID: {alliance_id})",
-                    value=f"{alliance_id}",
-                    description=f"👥 Members: {alliance_members[alliance_id]} | Click to delete",
+                    label=f"{alliance['name'][:40]} (ID: {alliance['alliance_id']})",
+                    value=f"{alliance['alliance_id']}",
+                    description=f"👥 Members: {alliance_members[alliance['alliance_id']]} | Click to delete",
                     emoji="🗑️"
-                ) for alliance_id, name in alliances
+                ) for alliance in alliances
             ]
             
             option_pages = [all_options[i:i + items_per_page] for i in range(0, len(all_options), items_per_page)]
@@ -1102,29 +1082,19 @@ class Alliance(commands.Cog):
         try:
             alliance_id = int(interaction.data["values"][0])
             
-            self.c.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-            alliance_data = self.c.fetchone()
+            alliance_data = mongo.alliance_list.find_one({"alliance_id": alliance_id})
             
             if not alliance_data:
                 await interaction.response.send_message("Alliance not found.", ephemeral=True)
                 return
             
-            alliance_name = alliance_data[0]
+            alliance_name = alliance_data["name"]
 
-            self.c.execute("SELECT COUNT(*) FROM alliancesettings WHERE alliance_id = ?", (alliance_id,))
-            settings_count = self.c.fetchone()[0]
-
-            self.c_users.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-            users_count = self.c_users.fetchone()[0]
-
-            self.c_settings.execute("SELECT COUNT(*) FROM adminserver WHERE alliances_id = ?", (alliance_id,))
-            admin_server_count = self.c_settings.fetchone()[0]
-
-            self.c_giftcode.execute("SELECT COUNT(*) FROM giftcode_channel WHERE alliance_id = ?", (alliance_id,))
-            gift_channels_count = self.c_giftcode.fetchone()[0]
-
-            self.c_giftcode.execute("SELECT COUNT(*) FROM giftcodecontrol WHERE alliance_id = ?", (alliance_id,))
-            gift_code_control_count = self.c_giftcode.fetchone()[0]
+            settings_count = mongo.alliancesettings.count_documents({"alliance_id": alliance_id})
+            users_count = mongo.users.count_documents({"alliance": alliance_id})
+            admin_server_count = mongo.adminserver.count_documents({"alliances_id": alliance_id})
+            gift_channels_count = mongo.giftcode_channel.count_documents({"alliance_id": alliance_id})
+            gift_code_control_count = mongo.giftcodecontrol.count_documents({"alliance_id": alliance_id})
 
             confirm_embed = discord.Embed(
                 title="⚠️ Confirm Alliance Deletion",
@@ -1149,29 +1119,23 @@ class Alliance(commands.Cog):
             
             async def confirm_callback(button_interaction: discord.Interaction):
                 try:
-                    self.c.execute("DELETE FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                    alliance_count = self.c.rowcount
+                    result = mongo.alliance_list.delete_one({"alliance_id": alliance_id})
+                    alliance_count = result.deleted_count
                     
-                    self.c.execute("DELETE FROM alliancesettings WHERE alliance_id = ?", (alliance_id,))
-                    admin_settings_count = self.c.rowcount
+                    result = mongo.alliancesettings.delete_one({"alliance_id": alliance_id})
+                    admin_settings_count = result.deleted_count
                     
-                    self.conn.commit()
+                    result = mongo.users.delete_many({"alliance": alliance_id})
+                    users_count_deleted = result.deleted_count
 
-                    self.c_users.execute("DELETE FROM users WHERE alliance = ?", (alliance_id,))
-                    users_count_deleted = self.c_users.rowcount
-                    self.conn_users.commit()
+                    result = mongo.adminserver.delete_many({"alliances_id": alliance_id})
+                    admin_server_count = result.deleted_count
 
-                    self.c_settings.execute("DELETE FROM adminserver WHERE alliances_id = ?", (alliance_id,))
-                    admin_server_count = self.c_settings.rowcount
-                    self.conn_settings.commit()
+                    result = mongo.giftcode_channel.delete_many({"alliance_id": alliance_id})
+                    gift_channels_count = result.deleted_count
 
-                    self.c_giftcode.execute("DELETE FROM giftcode_channel WHERE alliance_id = ?", (alliance_id,))
-                    gift_channels_count = self.c_giftcode.rowcount
-
-                    self.c_giftcode.execute("DELETE FROM giftcodecontrol WHERE alliance_id = ?", (alliance_id,))
-                    gift_code_control_count = self.c_giftcode.rowcount
-                    
-                    self.conn_giftcode.commit()
+                    result = mongo.giftcodecontrol.delete_many({"alliance_id": alliance_id})
+                    gift_code_control_count = result.deleted_count
 
                     cleanup_embed = discord.Embed(
                         title="✅ Alliance Successfully Deleted",
@@ -1790,5 +1754,4 @@ class PaginatedChannelView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 async def setup(bot):
-    conn = sqlite3.connect('db/alliance.sqlite')
-    await bot.add_cog(Alliance(bot, conn))
+    await bot.add_cog(Alliance(bot))

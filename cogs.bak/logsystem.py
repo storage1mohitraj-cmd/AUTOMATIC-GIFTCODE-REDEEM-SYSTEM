@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-import sqlite3
+from db.mongo_adapter import mongo
 from datetime import datetime
 from .alliance_member_operations import AllianceSelectView
 from .alliance import PaginatedChannelView
@@ -8,35 +8,8 @@ from .alliance import PaginatedChannelView
 class LogSystem(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.settings_db = sqlite3.connect('db/settings.sqlite', check_same_thread=False)
-        self.settings_cursor = self.settings_db.cursor()
-        
-        self.alliance_db = sqlite3.connect('db/alliance.sqlite', check_same_thread=False)
-        self.alliance_cursor = self.alliance_db.cursor()
-        
-        self.setup_database()
 
-    def setup_database(self):
-        try:
-            self.settings_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS alliance_logs (
-                    alliance_id INTEGER PRIMARY KEY,
-                    channel_id INTEGER,
-                    FOREIGN KEY (alliance_id) REFERENCES alliance_list (alliance_id)
-                )
-            """)
-            
-            self.settings_db.commit()
-                
-        except Exception as e:
-            print(f"Error setting up log system database: {e}")
-
-    def __del__(self):
-        try:
-            self.settings_db.close()
-            self.alliance_db.close()
-        except:
-            pass
+    # Database setup is handled by MongoAdapter
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -47,10 +20,9 @@ class LogSystem(commands.Cog):
         
         if custom_id == "log_system":
             try:
-                self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
-                result = self.settings_cursor.fetchone()
+                admin = mongo.admin.find_one({"id": interaction.user.id})
                 
-                if not result or result[0] != 1:
+                if not admin or admin.get("is_initial", 0) != 1:
                     await interaction.response.send_message(
                         "❌ Only global administrators can access the log system.", 
                         ephemeral=True
@@ -119,22 +91,17 @@ class LogSystem(commands.Cog):
 
         elif custom_id == "set_log_channel":
             try:
-                self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
-                result = self.settings_cursor.fetchone()
+                admin = mongo.admin.find_one({"id": interaction.user.id})
                 
-                if not result or result[0] != 1:
+                if not admin or admin.get("is_initial", 0) != 1:
                     await interaction.response.send_message(
                         "❌ Only global administrators can set log channels.", 
                         ephemeral=True
                     )
                     return
 
-                self.alliance_cursor.execute("""
-                    SELECT alliance_id, name 
-                    FROM alliance_list 
-                    ORDER BY name
-                """)
-                alliances = self.alliance_cursor.fetchall()
+                alliances = list(mongo.alliance_list.find({}, {"alliance_id": 1, "name": 1}).sort("name", 1))
+                alliances = [(a["alliance_id"], a["name"]) for a in alliances]
 
                 if not alliances:
                     await interaction.response.send_message(
@@ -145,11 +112,8 @@ class LogSystem(commands.Cog):
 
                 alliances_with_counts = []
                 for alliance_id, name in alliances:
-                    with sqlite3.connect('db/users.sqlite') as users_db:
-                        cursor = users_db.cursor()
-                        cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                        member_count = cursor.fetchone()[0]
-                        alliances_with_counts.append((alliance_id, name, member_count))
+                    member_count = mongo.users.count_documents({"alliance": int(alliance_id)})
+                    alliances_with_counts.append((alliance_id, name, member_count))
 
                 alliance_embed = discord.Embed(
                     title="📝 Set Log Channel",
@@ -185,14 +149,14 @@ class LogSystem(commands.Cog):
                             try:
                                 channel_id = int(channel_interaction.data["values"][0])
                                 
-                                self.settings_cursor.execute("""
-                                    INSERT OR REPLACE INTO alliance_logs (alliance_id, channel_id)
-                                    VALUES (?, ?)
-                                """, (alliance_id, channel_id))
-                                self.settings_db.commit()
+                                mongo.alliance_logs.update_one(
+                                    {"alliance_id": int(alliance_id)},
+                                    {"$set": {"channel_id": channel_id}},
+                                    upsert=True
+                                )
 
-                                self.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                                alliance_name = self.alliance_cursor.fetchone()[0]
+                                alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                                alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
 
                                 success_embed = discord.Embed(
                                     title="✅ Log Channel Set",
@@ -258,21 +222,17 @@ class LogSystem(commands.Cog):
 
         elif custom_id == "remove_log_channel":
             try:
-                self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
-                result = self.settings_cursor.fetchone()
+                admin = mongo.admin.find_one({"id": interaction.user.id})
                 
-                if not result or result[0] != 1:
+                if not admin or admin.get("is_initial", 0) != 1:
                     await interaction.response.send_message(
                         "❌ Only global administrators can remove log channels.", 
                         ephemeral=True
                     )
                     return
 
-                self.settings_cursor.execute("""
-                    SELECT al.alliance_id, al.channel_id 
-                    FROM alliance_logs al
-                """)
-                log_entries = self.settings_cursor.fetchall()
+                log_entries_docs = list(mongo.alliance_logs.find({}, {"alliance_id": 1, "channel_id": 1}))
+                log_entries = [(d["alliance_id"], d["channel_id"]) for d in log_entries_docs]
 
                 if not log_entries:
                     await interaction.response.send_message(
@@ -283,15 +243,11 @@ class LogSystem(commands.Cog):
 
                 alliances_with_counts = []
                 for alliance_id, channel_id in log_entries:
-                    self.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                    alliance_result = self.alliance_cursor.fetchone()
-                    alliance_name = alliance_result[0] if alliance_result else "Unknown Alliance"
+                    alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                    alliance_name = alliance_doc["name"] if alliance_doc else "Unknown Alliance"
 
-                    with sqlite3.connect('db/users.sqlite') as users_db:
-                        cursor = users_db.cursor()
-                        cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
-                        member_count = cursor.fetchone()[0]
-                        alliances_with_counts.append((alliance_id, alliance_name, member_count))
+                    member_count = mongo.users.count_documents({"alliance": int(alliance_id)})
+                    alliances_with_counts.append((alliance_id, alliance_name, member_count))
 
                 if not alliances_with_counts:
                     await interaction.response.send_message(
@@ -317,11 +273,11 @@ class LogSystem(commands.Cog):
                     try:
                         alliance_id = int(view.current_select.values[0])
                         
-                        self.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                        alliance_name = self.alliance_cursor.fetchone()[0]
+                        alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                        alliance_name = alliance_doc["name"] if alliance_doc else "Unknown"
                         
-                        self.settings_cursor.execute("SELECT channel_id FROM alliance_logs WHERE alliance_id = ?", (alliance_id,))
-                        channel_id = self.settings_cursor.fetchone()[0]
+                        log_entry = mongo.alliance_logs.find_one({"alliance_id": int(alliance_id)})
+                        channel_id = log_entry["channel_id"] if log_entry else None
                         
                         confirm_embed = discord.Embed(
                             title="⚠️ Confirm Removal",
@@ -338,11 +294,7 @@ class LogSystem(commands.Cog):
                         
                         async def confirm_callback(button_interaction: discord.Interaction):
                             try:
-                                self.settings_cursor.execute("""
-                                    DELETE FROM alliance_logs 
-                                    WHERE alliance_id = ?
-                                """, (alliance_id,))
-                                self.settings_db.commit()
+                                mongo.alliance_logs.delete_one({"alliance_id": int(alliance_id)})
 
                                 success_embed = discord.Embed(
                                     title="✅ Log Channel Removed",
@@ -437,22 +389,17 @@ class LogSystem(commands.Cog):
 
         elif custom_id == "view_log_channels":
             try:
-                self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
-                result = self.settings_cursor.fetchone()
+                admin = mongo.admin.find_one({"id": interaction.user.id})
                 
-                if not result or result[0] != 1:
+                if not admin or admin.get("is_initial", 0) != 1:
                     await interaction.response.send_message(
                         "❌ Only global administrators can view log channels.", 
                         ephemeral=True
                     )
                     return
 
-                self.settings_cursor.execute("""
-                    SELECT alliance_id, channel_id 
-                    FROM alliance_logs 
-                    ORDER BY alliance_id
-                """)
-                log_entries = self.settings_cursor.fetchall()
+                log_entries_docs = list(mongo.alliance_logs.find({}, {"alliance_id": 1, "channel_id": 1}).sort("alliance_id", 1))
+                log_entries = [(d["alliance_id"], d["channel_id"]) for d in log_entries_docs]
 
                 if not log_entries:
                     await interaction.response.send_message(
@@ -468,9 +415,8 @@ class LogSystem(commands.Cog):
                 )
 
                 for alliance_id, channel_id in log_entries:
-                    self.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-                    alliance_result = self.alliance_cursor.fetchone()
-                    alliance_name = alliance_result[0] if alliance_result else "Unknown Alliance"
+                    alliance_doc = mongo.alliance_list.find_one({"alliance_id": int(alliance_id)})
+                    alliance_name = alliance_doc["name"] if alliance_doc else "Unknown Alliance"
 
                     channel = interaction.guild.get_channel(channel_id)
                     channel_name = channel.name if channel else "Unknown Channel"

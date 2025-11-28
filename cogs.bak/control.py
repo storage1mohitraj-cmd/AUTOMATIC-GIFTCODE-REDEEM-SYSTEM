@@ -9,6 +9,7 @@ import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 from .login_handler import LoginHandler
+from db.mongo_adapter import MongoAdapter
 
 level_mapping = {
     31: "30-1", 32: "30-2", 33: "30-3", 34: "30-4",
@@ -30,6 +31,8 @@ class Control(commands.Cog):
         self.conn_alliance = sqlite3.connect('db/alliance.sqlite')
         self.conn_users = sqlite3.connect('db/users.sqlite')
         self.conn_changes = sqlite3.connect('db/changes.sqlite')
+        # Mongo adapter for new database backend
+        self.mongo = MongoAdapter()
         
         # Setup logger for alliance control
         self.logger = logging.getLogger('alliance_control')
@@ -62,19 +65,8 @@ class Control(commands.Cog):
         self.cursor_users = self.conn_users.cursor()
         self.cursor_changes = self.conn_changes.cursor()
         
-        self.conn_settings = sqlite3.connect('db/settings.sqlite')
-        self.cursor_settings = self.conn_settings.cursor()
-        self.cursor_settings.execute("""
-            CREATE TABLE IF NOT EXISTS auto (
-                id INTEGER PRIMARY KEY,
-                value INTEGER DEFAULT 1
-            )
-        """)
-        
-        self.cursor_settings.execute("SELECT COUNT(*) FROM auto")
-        if self.cursor_settings.fetchone()[0] == 0:
-            self.cursor_settings.execute("INSERT INTO auto (value) VALUES (1)")
-        self.conn_settings.commit()
+        # Ensure Mongo indexes and an auto document exist
+        self.mongo.ensure_indexes()
         
         self.db_lock = asyncio.Lock()
         self.proxies = self.load_proxies()
@@ -147,11 +139,7 @@ class Control(commands.Cog):
         self.logger.info(f"{alliance_name} Alliance Control started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         async with self.db_lock:
-            with sqlite3.connect('db/settings.sqlite') as settings_db:
-                cursor = settings_db.cursor()
-                cursor.execute("SELECT value FROM auto LIMIT 1")
-                result = cursor.fetchone()
-                auto_value = result[0] if result else 1
+            auto_value = self.mongo.get_auto_value()
         
         embed = discord.Embed(
             title=f"🏰 {alliance_name} Alliance Control",

@@ -6,11 +6,14 @@ import sqlite3
 import asyncio
 import requests
 from .alliance_member_operations import AllianceSelectView
+from db.mongo_adapter import MongoAdapter
 
 class BotOperations(commands.Cog):
     def __init__(self, bot, conn):
         self.bot = bot
         self.conn = conn
+        # Mongo adapter for new database backend
+        self.mongo = MongoAdapter()
         self.settings_db = sqlite3.connect('db/settings.sqlite', check_same_thread=False)
         self.settings_cursor = self.settings_db.cursor()
         self.alliance_db = sqlite3.connect('db/alliance.sqlite', check_same_thread=False)
@@ -29,6 +32,9 @@ class BotOperations(commands.Cog):
         
     def setup_database(self):
         try:
+            # Ensure Mongo collections and indexes exist
+            self.mongo.ensure_indexes()
+
             self.settings_cursor.execute("""
                 CREATE TABLE IF NOT EXISTS admin (
                     id INTEGER PRIMARY KEY,
@@ -70,19 +76,15 @@ class BotOperations(commands.Cog):
         
         if custom_id == "alliance_control_messages":
             try:
-                self.settings_cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (interaction.user.id,))
-                result = self.settings_cursor.fetchone()
-                
-                if not result or result[0] != 1:
+                # Use MongoDB for admin permission check
+                if not self.mongo.is_global_admin(interaction.user.id):
                     await interaction.response.send_message(
                         "❌ Only global administrators can use this command.", 
                         ephemeral=True
                     )
                     return
-
-                self.settings_cursor.execute("SELECT value FROM auto LIMIT 1")
-                result = self.settings_cursor.fetchone()
-                current_value = result[0] if result else 1
+                # Read current auto value from MongoDB
+                current_value = self.mongo.get_auto_value()
 
                 embed = discord.Embed(
                     title="💬 Alliance Control Messages Settings",
@@ -109,8 +111,8 @@ class BotOperations(commands.Cog):
                 )
 
                 async def open_callback(button_interaction: discord.Interaction):
-                    self.settings_cursor.execute("UPDATE auto SET value = 1")
-                    self.settings_db.commit()
+                    # Update MongoDB value
+                    self.mongo.set_auto_value(1)
                     
                     embed.description = "Alliance Control Information Message Turned On"
                     embed.color = discord.Color.green()
@@ -121,8 +123,8 @@ class BotOperations(commands.Cog):
                     await button_interaction.response.edit_message(embed=embed, view=view)
 
                 async def close_callback(button_interaction: discord.Interaction):
-                    self.settings_cursor.execute("UPDATE auto SET value = 0")
-                    self.settings_db.commit()
+                    # Update MongoDB value
+                    self.mongo.set_auto_value(0)
                     
                     embed.description = "Alliance Control Information Message Turned Off"
                     embed.color = discord.Color.red()
@@ -1228,4 +1230,4 @@ class BotOperations(commands.Cog):
             return None, None, [], False
 
 async def setup(bot):
-    await bot.add_cog(BotOperations(bot, sqlite3.connect('db/settings.sqlite'))) 
+    await bot.add_cog(BotOperations(bot, sqlite3.connect('db/settings.sqlite')))
