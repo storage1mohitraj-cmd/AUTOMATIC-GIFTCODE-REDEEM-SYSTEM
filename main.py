@@ -625,6 +625,13 @@ if __name__ == "__main__":
     async def check_and_update_files():
         beta_mode = "--beta" in sys.argv
         repair_mode = "--repair" in sys.argv
+        
+        # Skip updates in container environments unless explicitly requested
+        if is_container() and not repair_mode:
+            print(F.YELLOW + "Running in a container. Skipping automatic updates." + R)
+            print(F.YELLOW + "To force an update, use: python main.py --repair" + R)
+            return
+        
         release_info = get_latest_release_info(beta_mode=beta_mode)
         
         if release_info:
@@ -1008,6 +1015,24 @@ if __name__ == "__main__":
     async def main():
         await load_cogs()
         
+        # Start health check server for Render
+        try:
+            from aiohttp import web
+            
+            async def health_check(request):
+                return web.Response(text="OK")
+            
+            app = web.Application()
+            app.router.add_get('/', health_check)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            port = int(os.getenv("PORT", 8080))
+            site = web.TCPSite(runner, '0.0.0.0', port)
+            await site.start()
+            print(F.GREEN + f"Health check server running on port {port}" + R)
+        except Exception as e:
+            print(F.RED + f"Failed to start health check server: {e}" + R)
+
         await bot.start(bot_token)
 
     if __name__ == "__main__":
