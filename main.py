@@ -664,7 +664,7 @@ if __name__ == "__main__":
                     if "--autoupdate" in sys.argv or repair_mode:
                         update = True
                     else:
-                    else:
+
                         print("Note: If your terminal is not interactive, you can use the --autoupdate argument to skip this prompt.")
                         try:
                             ask = input("Do you want to update? (y/n): ").strip().lower()
