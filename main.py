@@ -891,14 +891,35 @@ if __name__ == "__main__":
 
     init(autoreset=True)
 
+    # Try to get bot token from multiple sources
+    bot_token = None
+    
+    # 1. Check environment variable (for Render and other cloud deployments)
+    bot_token = os.getenv("BOT_TOKEN")
+    
+    # 2. Check bot_token.txt file
     token_file = "bot_token.txt"
-    if not os.path.exists(token_file):
-        bot_token = input("Enter the bot token: ")
-        with open(token_file, "w") as f:
-            f.write(bot_token)
-    else:
+    if not bot_token and os.path.exists(token_file):
         with open(token_file, "r") as f:
             bot_token = f.read().strip()
+    
+    # 3. Prompt for input only in interactive environments
+    if not bot_token:
+        if is_container():
+            print(F.RED + "ERROR: BOT_TOKEN environment variable not set!" + R)
+            print(F.YELLOW + "Please set the BOT_TOKEN environment variable in your Render dashboard." + R)
+            sys.exit(1)
+        else:
+            try:
+                bot_token = input("Enter the bot token: ")
+                with open(token_file, "w") as f:
+                    f.write(bot_token)
+            except EOFError:
+                print(F.RED + "ERROR: Cannot read bot token in non-interactive environment!" + R)
+                print(F.YELLOW + "Please either:" + R)
+                print(F.YELLOW + "  1. Set BOT_TOKEN environment variable, or" + R)
+                print(F.YELLOW + f"  2. Create {token_file} file with your bot token" + R)
+                sys.exit(1)
 
     if not os.path.exists("db"):
         os.makedirs("db")
